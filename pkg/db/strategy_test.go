@@ -2,254 +2,239 @@ package db
 
 import (
 	"context"
-	"fmt"
-	"log"
-	"os"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
-	"k8s.io/client-go/kubernetes/scheme"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func newTestStore(t *testing.T) *Strategy {
-	_ = os.Remove("test.db")
-	db, err := gorm.Open(sqlite.Open("memory:test.db"), &gorm.Config{
-		SkipDefaultTransaction: true,
-		Logger: logger.New(log.New(os.Stdout, "\r\n", log.LstdFlags), logger.Config{
-			LogLevel: logger.Info,
-		}),
-	})
-	if err != nil {
-		t.Fatal(err)
+var ctx = context.Background()
+
+var testGVK = schema.GroupVersionKind{
+	Group:   "testgroup",
+	Version: "testversion",
+	Kind:    "TestKind",
+}
+
+type TestKind struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Value             string `json:"value,omitempty"`
+}
+
+func (t *TestKind) DeepCopyObject() runtime.Object {
+	return &TestKind{
+		TypeMeta:   t.TypeMeta,
+		ObjectMeta: *t.ObjectMeta.DeepCopy(),
+		Value:      t.Value,
+	}
+}
+
+// TestKindList contains a list of TestKind
+type TestKindList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []TestKind `json:"items"`
+}
+
+func (t *TestKindList) DeepCopyObject() runtime.Object {
+	// This is obviously wrong, but it's just a test
+	return &TestKindList{}
+}
+
+func newStrategy(t *testing.T) *Strategy {
+	t.Helper()
+
+	schema := runtime.NewScheme()
+	schema.AddKnownTypes(testGVK.GroupVersion(), &TestKind{}, &TestKindList{})
+
+	db := newDatabase(t)
+	_, err := db.sqlDB.Exec("DROP TABLE IF EXISTS strategytest")
+	require.NoError(t, err)
+	s, err := New(ctx, db.sqlDB, testGVK, schema, "strategytest")
+	require.NoError(t, err)
+
+	for i := range 3 {
+		suffix := strconv.Itoa(i + 1)
+		_, err = s.Create(context.Background(), &TestKind{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "testname" + suffix,
+				Namespace: "testnamespace" + suffix,
+				UID:       types.UID("testuid" + suffix),
+				Labels: map[string]string{
+					"test": suffix,
+				},
+			},
+			Value: "testvalue" + strconv.Itoa(i+1),
+		})
+		require.NoError(t, err)
 	}
 
-	err = db.Table("pod").AutoMigrate(&Record{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := NewStrategy(scheme.Scheme, &corev1.Pod{}, "pod", db, nil, false)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return s
 }
 
-func TestGet(t *testing.T) {
-	store := newTestStore(t)
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-name",
-			Namespace: "test-namespace",
-		},
-		Spec: corev1.PodSpec{
-			NodeName: "test",
-		},
-	}
-	_, err := store.Create(context.Background(), pod)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestStrategyListDefault(t *testing.T) {
+	s := newStrategy(t)
+	result, err := s.List(context.Background(), "", storage.ListOptions{})
+	require.NoError(t, err)
 
-	newObj, err := store.Get(context.Background(), "test-namespace", "test-name")
-	if err != nil {
-		t.Fatal(err)
-	}
+	list := result.(*TestKindList)
 
-	newPod := newObj.(*corev1.Pod)
-	assert.Equal(t, pod.UID, newPod.UID)
-	assert.Equal(t, "test", newPod.Spec.NodeName)
+	require.Len(t, list.Items, 3)
+
+	assert.Equal(t, "testname1", list.Items[0].Name)
+	assert.Equal(t, "1", list.Items[0].ResourceVersion)
+	assert.Equal(t, "testname2", list.Items[1].Name)
+	assert.Equal(t, "2", list.Items[1].ResourceVersion)
+	assert.Equal(t, "testname3", list.Items[2].Name)
+	assert.Equal(t, "3", list.Items[2].ResourceVersion)
 }
 
-func TestCreate(t *testing.T) {
-	store := newTestStore(t)
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-name",
-			Namespace: "test-namespace",
-		},
-	}
-	_, err := store.Create(context.Background(), pod)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestStrategyListRV(t *testing.T) {
+	s := newStrategy(t)
+	result, err := s.List(context.Background(), "", storage.ListOptions{
+		ResourceVersion: "2",
+	})
+	require.NoError(t, err)
 
-	assert.NotEqual(t, types.UID(""), pod.UID)
+	list := result.(*TestKindList)
 
-	pod2 := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-name",
-			Namespace: "test-namespace",
-		},
-	}
-	_, err = store.Create(context.Background(), pod2)
-	assert.True(t, apierrors.IsAlreadyExists(err))
+	require.Len(t, list.Items, 2)
+
+	assert.Equal(t, "testname1", list.Items[0].Name)
+	assert.Equal(t, "1", list.Items[0].ResourceVersion)
+	assert.Equal(t, "testname2", list.Items[1].Name)
+	assert.Equal(t, "2", list.Items[1].ResourceVersion)
 }
 
-func TestLabels(t *testing.T) {
-	store := newTestStore(t)
-	for i := range []*struct{}{nil, nil, nil} {
-		d := fmt.Sprint(i)
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-name" + d,
-				Namespace: "test-namespace",
-				Labels: map[string]string{
-					"test" + d: d,
-					"test":     d,
-				},
-			},
-		}
-		_, err := store.Create(context.Background(), pod)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-	}
-
-	list, err := store.List(context.Background(), "", toLabels(t, metav1.LabelSelector{
-		MatchLabels: map[string]string{
-			"test2": "2",
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pods := list.(*corev1.PodList)
-	assert.Len(t, pods.Items, 1)
-	assert.Equal(t, "test-name2", pods.Items[0].Name)
-
-	list, err = store.List(context.Background(), "", toLabels(t, metav1.LabelSelector{
-		MatchLabels: map[string]string{
-			"test2": "3",
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pods = list.(*corev1.PodList)
-	assert.Len(t, pods.Items, 0)
-
-	list, err = store.List(context.Background(), "", toLabels(t, metav1.LabelSelector{
-		MatchExpressions: []metav1.LabelSelectorRequirement{
-			{
-				Key:      "test",
-				Operator: metav1.LabelSelectorOpIn,
-				Values:   []string{"1", "2", "3"},
-			},
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pods = list.(*corev1.PodList)
-	assert.Len(t, pods.Items, 2)
-	assert.Equal(t, "test-name1", pods.Items[0].Name)
-	assert.Equal(t, "test-name2", pods.Items[1].Name)
-
-	list, err = store.List(context.Background(), "", toLabels(t, metav1.LabelSelector{
-		MatchExpressions: []metav1.LabelSelectorRequirement{
-			{
-				Key:      "test",
-				Operator: metav1.LabelSelectorOpNotIn,
-				Values:   []string{"1", "2", "3"},
-			},
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pods = list.(*corev1.PodList)
-	assert.Len(t, pods.Items, 1)
-	assert.Equal(t, "test-name0", pods.Items[0].Name)
-
-	list, err = store.List(context.Background(), "", toLabels(t, metav1.LabelSelector{
-		MatchExpressions: []metav1.LabelSelectorRequirement{
-			{
-				Key:      "test1",
-				Operator: metav1.LabelSelectorOpExists,
-			},
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pods = list.(*corev1.PodList)
-	assert.Len(t, pods.Items, 1)
-	assert.Equal(t, "test-name1", pods.Items[0].Name)
-
-	list, err = store.List(context.Background(), "", toLabels(t, metav1.LabelSelector{
-		MatchExpressions: []metav1.LabelSelectorRequirement{
-			{
-				Key:      "test1",
-				Operator: metav1.LabelSelectorOpDoesNotExist,
-			},
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pods = list.(*corev1.PodList)
-	assert.Len(t, pods.Items, 2)
-	assert.Equal(t, "test-name0", pods.Items[0].Name)
-	assert.Equal(t, "test-name2", pods.Items[1].Name)
-	assert.Equal(t, "3", pods.ResourceVersion)
-}
-
-func toLabels(t *testing.T, l metav1.LabelSelector) storage.ListOptions {
-	res, err := metav1.LabelSelectorAsSelector(&l)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return storage.ListOptions{
+func TestStrategyListFilterNeedTwoChunks(t *testing.T) {
+	s := newStrategy(t)
+	result, err := s.List(context.Background(), "", storage.ListOptions{
 		Predicate: storage.SelectionPredicate{
-			Label:    res,
-			GetAttrs: storage.DefaultNamespaceScopedAttr,
+			Limit: 1,
+			Label: labels.SelectorFromSet(map[string]string{
+				"test": "3",
+			}),
 		},
-	}
+	})
+	require.NoError(t, err)
+
+	list := result.(*TestKindList)
+
+	require.Len(t, list.Items, 1)
+
+	assert.Equal(t, "3", list.ResourceVersion)
+	assert.Equal(t, "", list.Continue)
+	assert.Equal(t, "testname3", list.Items[0].Name)
 }
 
-func TestUpdate(t *testing.T) {
-	store := newTestStore(t)
-	pod := &corev1.Pod{
+func TestStrategyDeleteNeedRevision(t *testing.T) {
+	s := newStrategy(t)
+	_, err := s.Delete(context.Background(), &TestKind{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-name",
-			Namespace: "test-namespace",
-			Labels: map[string]string{
-				"test": "1",
-			},
+			Name: "testname1",
 		},
-	}
-	_, err := store.Create(context.Background(), pod)
-	if err != nil {
-		t.Fatal(err)
-	}
+	})
+	assert.True(t, apierrors.IsConflict(err))
+}
 
-	newPod := pod.DeepCopy()
-	newPod.Spec.NodeName = "hi"
-	newPod.Status.Message = "bye"
+func TestStrategyDelete(t *testing.T) {
+	s := newStrategy(t)
+	result, err := s.Get(ctx, "", "testname3")
+	require.NoError(t, err)
+	assert.Equal(t, "3", result.GetResourceVersion())
+	assert.Equal(t, "testname3", result.GetName())
 
-	newObj, err := store.Update(context.Background(), newPod)
-	if err != nil {
-		t.Fatal(err)
-	}
+	result, err = s.Delete(context.Background(), result)
+	require.NoError(t, err)
+	assert.Equal(t, "4", result.GetResourceVersion())
+}
 
-	newPod = newObj.(*corev1.Pod)
-	assert.Equal(t, pod.Generation+1, newPod.Generation)
-	assert.Equal(t, "", pod.Status.Message)
-	assert.Equal(t, pod.UID, newPod.UID)
+func TestWatchNoRv(t *testing.T) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	s := newStrategy(t)
+	w, err := s.Watch(ctx, "", storage.ListOptions{})
+	require.NoError(t, err)
+
+	event := <-w
+	assert.Equal(t, watch.Added, event.Type)
+	assert.Equal(t, "1", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname1", event.Object.(kclient.Object).GetName())
+
+	event = <-w
+	assert.Equal(t, watch.Added, event.Type)
+	assert.Equal(t, "2", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname2", event.Object.(kclient.Object).GetName())
+
+	event = <-w
+	assert.Equal(t, watch.Added, event.Type)
+	assert.Equal(t, "3", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname3", event.Object.(kclient.Object).GetName())
+}
+
+func TestWatchRv(t *testing.T) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	s := newStrategy(t)
+	w, err := s.Watch(ctx, "", storage.ListOptions{
+		ResourceVersion: "2",
+	})
+	require.NoError(t, err)
+
+	event := <-w
+	assert.Equal(t, watch.Added, event.Type)
+	assert.Equal(t, "3", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname3", event.Object.(kclient.Object).GetName())
+}
+
+func TestWatchChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	s := newStrategy(t)
+	w, err := s.Watch(ctx, "", storage.ListOptions{
+		ResourceVersion: "2",
+	})
+	require.NoError(t, err)
+
+	event := <-w
+	assert.Equal(t, watch.Added, event.Type)
+	assert.Equal(t, "3", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname3", event.Object.(kclient.Object).GetName())
+
+	test1, err := s.Get(ctx, "", "testname1")
+	require.NoError(t, err)
+
+	test2, err := s.Get(ctx, "", "testname2")
+	require.NoError(t, err)
+
+	_, err = s.Delete(ctx, test1)
+	require.NoError(t, err)
+
+	test2.(*TestKind).Value = "newvalue"
+	_, err = s.Update(ctx, test2)
+	require.NoError(t, err)
+
+	event = <-w
+	assert.Equal(t, watch.Deleted, event.Type)
+	assert.Equal(t, "4", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname1", event.Object.(kclient.Object).GetName())
+
+	event = <-w
+	assert.Equal(t, watch.Modified, event.Type)
+	assert.Equal(t, "5", event.Object.(kclient.Object).GetResourceVersion())
+	assert.Equal(t, "testname2", event.Object.(kclient.Object).GetName())
 }

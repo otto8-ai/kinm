@@ -1,624 +1,409 @@
 package db
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
+	"database/sql"
+	_ "embed"
 	"encoding/json"
-	"net/http"
+	"fmt"
+	"iter"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/otto8-ai/kinm/pkg/db/errors"
+	"github.com/otto8-ai/kinm/pkg/db/statements"
+	"github.com/otto8-ai/kinm/pkg/strategy"
 	"github.com/otto8-ai/kinm/pkg/types"
-	"gorm.io/gorm"
-	apierror "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
-	"k8s.io/apiserver/pkg/storage/value"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"k8s.io/klog/v2"
 )
 
+var _ strategy.CompleteStrategy = (*Strategy)(nil)
+
 type Strategy struct {
-	scheme              *runtime.Scheme
-	db                  DB
-	obj                 runtime.Object
-	objList             runtime.Object
-	gvk                 schema.GroupVersionKind
-	partitionIDRequired bool
+	db               db
+	objTemplate      types.Object
+	objListTemplate  types.ObjectList
+	scheme           *runtime.Scheme
+	cancelCompaction func()
 
-	dbCtx    context.Context
-	dbCancel func()
+	broadcastLock sync.Mutex
+	broadcast     chan struct{}
 }
 
-type cont struct {
-	ID uint `json:"id,omitempty"`
+type record struct {
+	id               int64
+	name, namespace  string
+	previousID       *int64
+	uid              string
+	created, deleted int16
+	value            string
 }
 
-func NewStrategy(scheme *runtime.Scheme, obj runtime.Object, tableName string, db *gorm.DB, transformers map[schema.GroupKind]value.Transformer, partitionIDRequired bool) (*Strategy, error) {
-	gvk, err := apiutil.GVKForObject(obj, scheme)
+func (r *record) Unmarshal(obj types.Object) error {
+	if err := json.Unmarshal([]byte(r.value), obj); err != nil {
+		return err
+	}
+	obj.SetResourceVersion(strconv.FormatInt(r.id, 10))
+	return nil
+}
+
+func New(ctx context.Context, sqlDB *sql.DB, gvk schema.GroupVersionKind, scheme *runtime.Scheme, tableName string) (*Strategy, error) {
+	objTemplate, err := scheme.New(gvk)
 	if err != nil {
 		return nil, err
 	}
-
-	// test we can create objects
-	_, err = scheme.New(gvk)
+	objListTemplate, err := scheme.New(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
 	if err != nil {
 		return nil, err
 	}
+	newDB := db{
+		sqlDB: sqlDB,
+		stmt:  statements.New(tableName, sqlDB.Stats().MaxOpenConnections != 1),
+		gvk:   gvk,
+	}
+	if err := newDB.migrate(ctx); err != nil {
+		return nil, err
+	}
 
-	objList, err := scheme.New(schema.GroupVersionKind{
-		Group:   gvk.Group,
-		Version: gvk.Version,
-		Kind:    gvk.Kind + "List",
-	})
 	s := &Strategy{
-		scheme:              scheme,
-		db:                  NewDB(tableName, gvk, db, transformers),
-		gvk:                 gvk,
-		obj:                 obj,
-		objList:             objList,
-		partitionIDRequired: partitionIDRequired,
-	}
-	s.dbCtx, s.dbCancel = context.WithCancel(context.Background())
-	return s, s.db.Start(s.dbCtx)
-}
-
-func (s *Strategy) Destroy() {
-	s.dbCancel()
-}
-
-func (s *Strategy) Start(ctx context.Context) {
-	s.db.Start(ctx)
-}
-
-func (s *Strategy) Get(ctx context.Context, namespace, name string) (types.Object, error) {
-	partitionID := PartitionIDFromContext(ctx)
-	if s.partitionIDRequired && partitionID == "" {
-		return nil, newPartitionRequiredError()
+		db:              newDB,
+		objTemplate:     objTemplate.(types.Object),
+		objListTemplate: objListTemplate.(types.ObjectList),
+		scheme:          scheme,
+		broadcast:       make(chan struct{}),
 	}
 
-	records, _, err := s.db.Get(ctx, Criteria{
-		Name:              name,
-		Namespace:         strptr(namespace),
-		NoResourceVersion: true,
-		PartitionID:       partitionID,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(records) == 0 {
-		return nil, errors.NewNotFound(s.gvk, name)
-	}
-
-	obj := s.obj.DeepCopyObject()
-	return obj.(types.Object), s.recordIntoObject(&records[0], obj)
-}
-
-func (s *Strategy) GetToList(ctx context.Context, namespace, name string) (types.ObjectList, error) {
-	partitionID := PartitionIDFromContext(ctx)
-	if s.partitionIDRequired && partitionID == "" {
-		return nil, newPartitionRequiredError()
-	}
-
-	list := s.objList.DeepCopyObject().(types.ObjectList)
-	obj := s.obj.DeepCopyObject()
-
-	records, resourceVersionInt, err := s.db.Get(ctx, Criteria{
-		Name:        name,
-		Namespace:   strptr(namespace),
-		PartitionID: partitionID,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	list.SetResourceVersion(strconv.FormatUint(uint64(resourceVersionInt), 10))
-
-	if len(records) == 0 {
-		return list, nil
-	}
-
-	if err := s.recordIntoObject(&records[0], obj); err != nil {
-		return nil, err
-	}
-
-	return list, meta.SetList(list, []runtime.Object{obj})
-}
-
-func (s *Strategy) Watch(ctx context.Context, namespace string, opts storage.ListOptions) (<-chan watch.Event, error) {
-	partitionID := PartitionIDFromContext(ctx)
-	if s.partitionIDRequired && partitionID == "" {
-		return nil, newPartitionRequiredError()
-	}
-
-	criteria := WatchCriteria{
-		Namespace:     nilOnEmpty(namespace),
-		LabelSelector: opts.Predicate.Label,
-		FieldSelector: opts.Predicate.Field,
-		PartitionID:   partitionID,
-	}
-	name, ok := opts.Predicate.MatchesSingle()
-	if ok {
-		criteria.Name = name
-	}
-	if opts.ResourceVersion != "" {
-		after, err := strconv.ParseUint(opts.ResourceVersion, 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		criteria.After = uint(after)
-	}
-	records, err := s.db.Watch(ctx, criteria)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make(chan watch.Event)
+	ctx, cancel := context.WithCancel(ctx)
 	go func() {
-		defer close(result)
-
-		for record := range records {
-			obj := s.newObj()
-			if record.Name == "" {
-				obj.SetResourceVersion(strconv.FormatUint(uint64(record.ID), 10))
-				if opts.Predicate.AllowWatchBookmarks {
-					result <- watch.Event{
-						Type:   watch.Bookmark,
-						Object: obj,
-					}
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if count, err := s.db.compact(ctx); err != nil {
+					klog.Errorf("failed to compact %q: %v", tableName, err)
+				} else if count > 0 {
+					klog.Infof("compacted %q: %d records", tableName, count)
 				}
-				continue
-			}
-
-			if criteria.PartitionID != "" && record.PartitionID != criteria.PartitionID {
-				continue
-			}
-
-			if criteria.Name != "" && record.Name != criteria.Name {
-				continue
-			}
-
-			if criteria.Namespace != nil && record.Namespace != *criteria.Namespace {
-				continue
-			}
-
-			event := watch.Event{}
-			match := true
-			err := s.recordIntoObject(&record, obj)
-			if err == nil {
-				match, err = opts.Predicate.Matches(obj)
-			}
-			if err != nil {
-				event.Type = watch.Error
-				status := apierror.NewGenericServerResponse(http.StatusInternalServerError, "watch", schema.GroupResource{
-					Group:    s.gvk.Group,
-					Resource: s.gvk.Kind,
-				}, record.Name, err.Error(), 0, true).Status()
-				event.Object = &status
-				result <- event
-			} else if match {
-				if record.Create {
-					event.Type = watch.Added
-					event.Object = obj
-				} else if record.Removed != nil {
-					event.Type = watch.Deleted
-					event.Object = obj
-				} else {
-					event.Type = watch.Modified
-					event.Object = obj
-				}
-				result <- event
 			}
 		}
 	}()
 
+	s.cancelCompaction = cancel
+	return s, nil
+}
+
+func (s *Strategy) Create(ctx context.Context, object types.Object) (types.Object, error) {
+	if object.GetUID() == "" {
+		return nil, fmt.Errorf("object must have a UID")
+	}
+
+	defer s.broadcastChange()
+
+	// On create all objects have a generation of 1
+	object.SetGeneration(1)
+
+	var buf strings.Builder
+	if err := json.NewEncoder(&buf).Encode(object); err != nil {
+		return nil, err
+	}
+
+	id, err := s.db.insert(ctx, record{
+		name:      object.GetName(),
+		namespace: object.GetNamespace(),
+		uid:       string(object.GetUID()),
+		created:   1,
+		value:     buf.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := object.DeepCopyObject().(types.Object)
+	result.SetResourceVersion(strconv.FormatInt(id, 10))
 	return result, nil
 }
 
 func (s *Strategy) New() types.Object {
-	return s.obj.DeepCopyObject().(types.Object)
+	return s.objTemplate.DeepCopyObject().(types.Object)
 }
 
-func (s *Strategy) NewList() types.ObjectList {
-	return s.objList.DeepCopyObject().(types.ObjectList)
-}
-
-func (s *Strategy) newObj() types.Object {
-	obj, err := s.scheme.New(s.gvk)
-	if err != nil {
-		panic("failed to create object for watch: " + err.Error())
-	}
-	return obj.(types.Object)
-}
-
-func (s *Strategy) List(ctx context.Context, namespace string, opts storage.ListOptions) (types.ObjectList, error) {
-	partitionID := PartitionIDFromContext(ctx)
-	if s.partitionIDRequired && partitionID == "" {
-		return nil, newPartitionRequiredError()
-	}
-
-	list := s.objList.DeepCopyObject().(types.ObjectList)
-
-	result, err := s.list(ctx, nilOnEmpty(namespace), partitionID, opts)
+func (s *Strategy) Get(ctx context.Context, namespace, name string) (types.Object, error) {
+	rec, err := s.db.get(ctx, namespace, name)
 	if err != nil {
 		return nil, err
 	}
-
-	list.SetResourceVersion(result.ResourceVersion)
-	list.SetContinue(result.Continue)
-	list.SetRemainingItemCount(result.RemainingCount)
-	return list, meta.SetList(list, result.Items)
-}
-
-type listResult struct {
-	Items           []runtime.Object
-	Continue        string
-	ResourceVersion string
-	RemainingCount  *int64
-}
-
-func (s *Strategy) list(ctx context.Context, namespace *string, partitionID string, opts storage.ListOptions) (*listResult, error) {
-	result := &listResult{}
-
-	if opts.Predicate.Limit != 0 {
-		opts.Predicate.Limit += 1
-	}
-
-	criteria := Criteria{
-		Namespace:     namespace,
-		Limit:         opts.Predicate.Limit,
-		LabelSelector: opts.Predicate.Label,
-		FieldSelector: opts.Predicate.Field,
-		PartitionID:   partitionID,
-	}
-
-	if opts.Predicate.Continue != "" {
-		data, err := base64.StdEncoding.DecodeString(opts.Predicate.Continue)
-		if err != nil {
-			return nil, err
-		}
-		cont := &cont{}
-		if err := json.Unmarshal(data, cont); err != nil {
-			return nil, err
-		}
-		criteria.After = cont.ID
-		criteria.ignoreCompactionCheck = criteria.After != 0
-	}
-
-	records, resourceVersionInt, err := s.db.Get(ctx, criteria)
-	if err != nil {
+	result := s.New()
+	if err := json.Unmarshal([]byte(rec.value), result); err != nil {
 		return nil, err
 	}
-
-	var objs []runtime.Object
-	for _, rec := range records {
-		obj := s.obj.DeepCopyObject()
-		err := s.recordIntoObject(&rec, obj)
-		if err != nil {
-			return nil, err
-		}
-		if ok, err := opts.Predicate.Matches(obj); err != nil {
-			return nil, err
-		} else if ok {
-			objs = append(objs, obj)
-		}
-	}
-
-	if opts.Predicate.Limit != 0 && int64(len(objs)) == opts.Predicate.Limit {
-		data, err := json.Marshal(&cont{
-			ID: records[len(records)-2].ID,
-		})
-		if err != nil {
-			return nil, err
-		}
-		objs = objs[0 : len(objs)-1]
-		result.Continue = base64.StdEncoding.EncodeToString(data)
-		result.RemainingCount = &[]int64{1}[0]
-	}
-
-	result.ResourceVersion = strconv.FormatUint(uint64(resourceVersionInt), 10)
-	result.Items = objs
+	result.SetResourceVersion(strconv.FormatInt(rec.id, 10))
 	return result, nil
 }
 
-func (s *Strategy) getExisting(ctx context.Context, gvk schema.GroupVersionKind, namespace *string, name, partitionID string) (*Record, error) {
-	existing, _, err := s.db.Get(ctx, Criteria{
-		Name:              name,
-		Namespace:         namespace,
-		Limit:             1,
-		NoResourceVersion: true,
-		IncludeDeleted:    true,
-		IncludeGC:         true,
-		PartitionID:       partitionID,
-	})
+func (s *Strategy) Update(ctx context.Context, obj types.Object) (types.Object, error) {
+	defer s.broadcastChange()
+	return s.doUpdate(ctx, obj, true, false)
+}
+
+func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGeneration, deleted bool) (types.Object, error) {
+	var buf strings.Builder
+
+	obj = obj.DeepCopyObject().(types.Object)
+	if updateGeneration {
+		obj.SetGeneration(obj.GetGeneration() + 1)
+	}
+
+	if err := json.NewEncoder(&buf).Encode(obj); err != nil {
+		return nil, err
+	}
+
+	var (
+		resourceVersion int64
+		err             error
+	)
+	if obj.GetResourceVersion() != "" {
+		resourceVersion, err = strconv.ParseInt(obj.GetResourceVersion(), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	rec := record{
+		name:       obj.GetName(),
+		namespace:  obj.GetNamespace(),
+		previousID: &resourceVersion,
+		uid:        string(obj.GetUID()),
+		value:      buf.String(),
+	}
+
+	var id int64
+	if deleted {
+		id, err = s.db.delete(ctx, rec)
+	} else {
+		id, err = s.db.insert(ctx, rec)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if len(existing) == 0 {
-		return nil, errors.NewNotFound(gvk, name)
-	}
-	return &existing[0], nil
-}
 
-func (s *Strategy) Delete(ctx context.Context, obj types.Object) (types.Object, error) {
-	return s.Update(ctx, obj)
+	obj.SetResourceVersion(strconv.FormatInt(id, 10))
+	return obj, nil
 }
 
 func (s *Strategy) UpdateStatus(ctx context.Context, obj types.Object) (types.Object, error) {
-	newObj, err := s.update(ctx, true, obj)
-	return newObj, translateDuplicateEntryErr(err, s.gvk, obj.GetName())
+	return s.doUpdate(ctx, obj, false, false)
 }
 
-func (s *Strategy) Update(ctx context.Context, obj types.Object) (types.Object, error) {
-	newObj, err := s.update(ctx, false, obj)
-	return newObj, translateDuplicateEntryErr(err, s.gvk, obj.GetName())
-}
-
-func strptr(s string) *string {
-	return &s
-}
-
-func nilOnEmpty(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-func (s *Strategy) update(ctx context.Context, status bool, obj types.Object) (types.Object, error) {
-	partitionID := PartitionIDFromContext(ctx)
-	if s.partitionIDRequired && partitionID == "" {
-		return nil, newPartitionRequiredError()
+func (s *Strategy) prepareList(opts storage.ListOptions) (storage.ListOptions, error) {
+	if opts.ResourceVersionMatch != "" {
+		return opts, fmt.Errorf("resource version match is not supported")
 	}
 
-	gvk, err := apiutil.GVKForObject(obj, s.scheme)
+	if opts.Predicate.Continue != "" && opts.ResourceVersion == "" {
+		return opts, fmt.Errorf("resource version is required with continue")
+	}
+
+	if opts.Predicate.Label == nil {
+		opts.Predicate.Label = labels.Everything()
+	}
+	if opts.Predicate.Field == nil {
+		opts.Predicate.Field = fields.Everything()
+	}
+	if opts.Predicate.GetAttrs == nil {
+		opts.Predicate.GetAttrs = storage.DefaultNamespaceScopedAttr
+	}
+
+	return opts, nil
+}
+
+func (s *Strategy) List(ctx context.Context, namespace string, opts storage.ListOptions) (types.ObjectList, error) {
+	var (
+		objs       []runtime.Object
+		listResult = s.NewList()
+		err        error
+	)
+
+	opts, err = s.prepareList(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	existing, err := s.getExisting(ctx, gvk, strptr(obj.GetNamespace()), obj.GetName(), partitionID)
+	listResourceVersion, iter, err := newLister(ctx, &s.db, namespace, opts, false)
 	if err != nil {
 		return nil, err
 	}
 
-	if obj.GetResourceVersion() != strconv.FormatUint(uint64(existing.ID), 10) {
-		return nil, errors.NewResourceVersionMismatch(gvk, obj.GetName())
-	}
-
-	if err := storage.NewUIDPreconditions(existing.UID).Check(obj.GetName(), obj); err != nil {
-		return nil, errors.NewConflict(gvk, obj.GetName(), err)
-	}
-
-	newRecord, err := s.objectToRecord(obj)
-	if err != nil {
-		return nil, err
-	}
-
-	newRecord.Previous = &existing.ID
-	newRecord.Created = existing.Created
-	newRecord.Deleted = existing.Deleted
-	newRecord.Removed = existing.Removed
-	newRecord.UID = existing.UID
-	newRecord.PartitionID = existing.PartitionID
-	newRecord.Updated = time.Now()
-	if status {
-		newRecord.Generation = existing.Generation
-		newRecord.Data = existing.Data
-		newRecord.Metadata = existing.Metadata
-	} else {
-		if newRecord.Deleted == nil && !obj.GetDeletionTimestamp().IsZero() {
-			newRecord.Deleted = &obj.GetDeletionTimestamp().Time
+	for rec, err := range iter {
+		if err != nil {
+			return nil, err
 		}
 
-		if newRecord.Removed == nil && newRecord.Deleted != nil && len(obj.GetFinalizers()) == 0 {
-			newRecord.Removed = &newRecord.Updated
+		obj := s.New()
+		if err := rec.Unmarshal(obj); err != nil {
+			return nil, err
 		}
 
-		if bytes.Equal(newRecord.Metadata, existing.Metadata) && bytes.Equal(newRecord.Data, existing.Data) {
-			newRecord.Generation = existing.Generation
-		} else {
-			newRecord.Generation = existing.Generation + 1
-			newRecord.Status = existing.Status
+		if match, err := opts.Predicate.Matches(obj); err != nil {
+			return nil, err
+		} else if !match {
+			continue
 		}
+
+		// We check this at the end because the next object could possibly not match the predicate so
+		// we don't want to do continue token to them result in the next call being an empty list.
+		if opts.Predicate.Limit > 0 && len(objs) >= int(opts.Predicate.Limit) {
+			listResult.SetContinue(objs[len(objs)-1].(types.Object).GetResourceVersion())
+			break
+		}
+		objs = append(objs, obj)
 	}
 
-	err = s.db.Insert(ctx, newRecord)
+	listResult.SetResourceVersion(listResourceVersion)
+	return listResult, meta.SetList(listResult, objs)
+}
+
+func (s *Strategy) NewList() types.ObjectList {
+	return s.objListTemplate.DeepCopyObject().(types.ObjectList)
+}
+
+func (s *Strategy) Delete(ctx context.Context, obj types.Object) (types.Object, error) {
+	defer s.broadcastChange()
+	return s.doUpdate(ctx, obj, false, true)
+}
+
+func (s *Strategy) Watch(ctx context.Context, namespace string, opts storage.ListOptions) (<-chan watch.Event, error) {
+	opts, err := s.prepareList(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	return obj, s.recordIntoObject(newRecord, obj)
+	if opts.Predicate.Continue != "" {
+		return nil, fmt.Errorf("continue is not supported in watch")
+	}
+
+	if opts.Predicate.Limit != 0 {
+		return nil, fmt.Errorf("limit is not supported in watch")
+	}
+
+	if opts.ResourceVersion == "0" {
+		opts.ResourceVersion = ""
+	}
+
+	// If resourceVersion is set we immediately go to watch phase and skip the historical list
+	resourceVersion, lister, err := newLister(ctx, &s.db, namespace, opts, opts.ResourceVersion != "")
+	if err != nil {
+		return nil, err
+	}
+
+	opts.ResourceVersion = resourceVersion
+
+	ch := make(chan watch.Event)
+	go s.streamWatch(ctx, namespace, opts, lister, ch)
+	return ch, nil
 }
 
-func (s *Strategy) Create(ctx context.Context, obj types.Object) (result types.Object, err error) {
-	err = s.db.Transaction(ctx, func(ctx context.Context) error {
-		result, err = s.create(ctx, obj)
-		return translateDuplicateEntryErr(err, s.gvk, obj.GetName())
-	})
+func toWatchEventError(err error) watch.Event {
+	if _, ok := err.(apierrors.APIStatus); !ok {
+		err = apierrors.NewInternalError(err)
+	}
+	status := err.(apierrors.APIStatus).Status()
+	return watch.Event{
+		Type:   watch.Error,
+		Object: &status,
+	}
+}
+
+func (s *Strategy) toWatchEvent(rec record) watch.Event {
+	obj := s.New()
+	if err := rec.Unmarshal(obj); err != nil {
+		return toWatchEventError(err)
+	}
+	switch {
+	case rec.created == 1:
+		return watch.Event{Type: watch.Added, Object: obj}
+	case rec.deleted == 1:
+		return watch.Event{Type: watch.Deleted, Object: obj}
+	default:
+		return watch.Event{Type: watch.Modified, Object: obj}
+	}
+}
+
+func (s *Strategy) broadcastChange() {
+	s.broadcastLock.Lock()
+	defer s.broadcastLock.Unlock()
+	close(s.broadcast)
+	s.broadcast = make(chan struct{})
 	return
 }
 
-func (s *Strategy) create(ctx context.Context, obj types.Object) (types.Object, error) {
-	partitionID := PartitionIDFromContext(ctx)
-	if s.partitionIDRequired && partitionID == "" {
-		return nil, newPartitionRequiredError()
-	}
-
-	existing, _, err := s.db.Get(ctx, Criteria{
-		Name:              obj.GetName(),
-		Namespace:         strptr(obj.GetNamespace()),
-		Limit:             1,
-		NoResourceVersion: true,
-		IncludeDeleted:    true,
-		IncludeGC:         true,
-		PartitionID:       partitionID,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	record, err := s.objectToRecord(obj)
-	if err != nil {
-		return nil, err
-	}
-	record.Create = true
-	record.Status = nil
-
-	if len(existing) == 1 {
-		if existing[0].Removed == nil {
-			return nil, errors.NewAlreadyExists(s.gvk, obj.GetName())
-		}
-		record.Previous = &existing[0].ID
-	}
-
-	record.PartitionID = partitionID
-
-	err = s.db.Insert(ctx, record)
-	if err != nil {
-		return nil, err
-	}
-
-	return obj, s.recordIntoObject(record, obj)
+func (s *Strategy) waitChange() <-chan struct{} {
+	s.broadcastLock.Lock()
+	defer s.broadcastLock.Unlock()
+	return s.broadcast
 }
 
-func (s *Strategy) recordToMap(rec *Record) (map[string]any, error) {
-	metadata := map[string]any{}
-	data := map[string]any{}
-	if len(rec.Data) > 0 {
-		err := json.Unmarshal(rec.Data, &data)
-		if err != nil {
-			return nil, err
-		}
+func (s *Strategy) streamWatch(ctx context.Context, namespace string, opts storage.ListOptions, lister iter.Seq2[record, error], ch chan watch.Event) {
+	defer close(ch)
+
+	var bookmarks <-chan time.Time
+	if opts.ProgressNotify {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		bookmarks = ticker.C
 	}
 
-	if len(rec.Metadata) > 0 {
-		err := json.Unmarshal(rec.Metadata, &metadata)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if len(rec.Status) > 0 {
-		status := map[string]any{}
-
-		err := json.Unmarshal(rec.Status, &status)
-		if err != nil {
-			return nil, err
+	for {
+		for rec, err := range lister {
+			if err != nil {
+				ch <- toWatchEventError(err)
+				return
+			}
+			ch <- s.toWatchEvent(rec)
 		}
 
-		data["status"] = status
+		var (
+			newResourceVersion string
+			err                error
+		)
+
+		newResourceVersion, lister, err = newLister(ctx, &s.db, namespace, opts, true)
+		if err != nil {
+			ch <- toWatchEventError(err)
+			return
+		}
+
+		if newResourceVersion == opts.ResourceVersion {
+			select {
+			case <-ctx.Done():
+				return
+			case <-bookmarks:
+				ch <- watch.Event{Type: watch.Bookmark, Object: nil}
+			case <-s.waitChange():
+			case <-time.After(2 * time.Second):
+			}
+		}
+
+		opts.ResourceVersion = newResourceVersion
 	}
-
-	gvk := schema.GroupVersionKind{
-		Group:   rec.APIGroup,
-		Version: rec.Version,
-		Kind:    rec.Kind,
-	}
-
-	apiVersion, kind := gvk.ToAPIVersionAndKind()
-
-	data["kind"] = kind
-	data["apiVersion"] = apiVersion
-
-	metadata["uid"] = rec.UID
-	metadata["resourceVersion"] = strconv.Itoa(int(rec.ID))
-	metadata["name"] = rec.Name
-	metadata["namespace"] = rec.Namespace
-	metadata["generation"] = rec.Generation
-	metadata["creationTimestamp"] = rec.Created.Format(time.RFC3339)
-	if rec.Deleted != nil {
-		metadata["deletionTimestamp"] = rec.Deleted.Format(time.RFC3339)
-	}
-
-	data["metadata"] = metadata
-
-	return data, nil
 }
 
-func (s *Strategy) recordIntoObject(rec *Record, obj runtime.Object) error {
-	recordMap, err := s.recordToMap(rec)
-	if err != nil {
-		return err
-	}
-	d, err := json.Marshal(recordMap)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(d, obj)
-}
-
-func (s *Strategy) objectToRecord(obj types.Object) (*Record, error) {
-	gvk, err := apiutil.GVKForObject(obj, s.scheme)
-	if err != nil {
-		return nil, err
-	}
-
-	mapData, err := toMap(obj)
-	if err != nil {
-		return nil, err
-	}
-
-	status, _ := mapData["status"].(map[string]any)
-
-	metadata, _ := mapData["metadata"].(map[string]any)
-	delete(metadata, "resourceVersion")
-	delete(metadata, "generation")
-	delete(metadata, "uid")
-	delete(metadata, "creationTimestamp")
-	delete(metadata, "deletionTimestamp")
-	delete(metadata, "name")
-	delete(metadata, "namespace")
-
-	metadataData, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, err
-	}
-
-	delete(mapData, "status")
-	delete(mapData, "metadata")
-	delete(mapData, "kind")
-	delete(mapData, "apiVersion")
-
-	specData, err := json.Marshal(mapData)
-	if err != nil {
-		return nil, err
-	}
-
-	statusData, err := json.Marshal(status)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Record{
-		Kind:       gvk.Kind,
-		Version:    gvk.Version,
-		APIGroup:   gvk.Group,
-		Name:       obj.GetName(),
-		Namespace:  obj.GetNamespace(),
-		UID:        string(uuid.NewUUID()),
-		Generation: 1,
-		Previous:   nil,
-		Created:    time.Now(),
-		Metadata:   metadataData,
-		Data:       specData,
-		Status:     statusData,
-	}, nil
+func (s *Strategy) Destroy() {
+	s.cancelCompaction()
+	s.db.Close()
 }
 
 func (s *Strategy) Scheme() *runtime.Scheme {
 	return s.scheme
-}
-
-func toMap(obj any) (map[string]any, error) {
-	data, err := json.Marshal(obj)
-	if err != nil {
-		return nil, err
-	}
-	result := map[string]any{}
-	return result, json.Unmarshal(data, &result)
 }

@@ -1,17 +1,20 @@
-package pg
+package db
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"testing"
 
+	_ "github.com/glebarez/go-sqlite"
 	_ "github.com/lib/pq"
-	"github.com/otto8-ai/kinm/pkg/pg/statements"
+	"github.com/otto8-ai/kinm/pkg/db/statements"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apiserver/pkg/storage"
 )
 
 const (
@@ -24,13 +27,13 @@ const (
 
 func newDatabase(t *testing.T) *db {
 	t.Helper()
-	sqldb := newSQLDB(t)
+	sqldb, lock := newSQLDB(t)
 	_, err := sqldb.ExecContext(context.Background(), "DROP TABLE IF EXISTS recordstest")
 	require.NoError(t, err)
 	s := &db{
-		db:   sqldb,
-		stmt: statements.New("recordstest"),
-		gvk:  testGVK,
+		sqlDB: sqldb,
+		stmt:  statements.New("recordstest", lock),
+		gvk:   testGVK,
 	}
 	require.NoError(t, s.migrate(context.Background()))
 	insertRows(t, s)
@@ -39,14 +42,24 @@ func newDatabase(t *testing.T) *db {
 	return s
 }
 
-func newSQLDB(t *testing.T) *sql.DB {
+func newSQLDB(t *testing.T) (*sql.DB, bool) {
 	t.Helper()
 
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s "+
-		"password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname)
-
-	db, err := sql.Open("postgres", psqlInfo)
+	var (
+		err  error
+		lock bool
+		db   *sql.DB
+	)
+	if os.Getenv("KINM_TEST_DB") == "sqlite" {
+		db, err = sql.Open("sqlite", "otto.db")
+		db.SetMaxOpenConns(1)
+	} else {
+		lock = true
+		psqlInfo := fmt.Sprintf("host=%s port=%d user=%s "+
+			"password=%s dbname=%s sslmode=disable",
+			host, port, user, password, dbname)
+		db, err = sql.Open("postgres", psqlInfo)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,7 +72,7 @@ func newSQLDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 
-	return db
+	return db, lock
 }
 
 func TestMigrate(t *testing.T) {
@@ -72,7 +85,7 @@ func insertRows(t *testing.T, s *db) {
 	id, err := s.insert(context.Background(), record{
 		name:      "test",
 		namespace: "default",
-		created:   true,
+		created:   1,
 		value:     "value1",
 	})
 	require.NoError(t, err)
@@ -106,14 +119,14 @@ func TestInsert(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, records, 1)
 
-	assert.Equal(t, true, records[0].created)
+	assert.Equal(t, int16(1), records[0].created)
 
 	_, records, err = s.list(context.Background(), nil, nil, 1, true, 0, 0)
 	require.NoError(t, err)
 	assert.Len(t, records, 2)
 
-	assert.Equal(t, false, records[0].created)
-	assert.Equal(t, false, records[1].created)
+	assert.Equal(t, int16(0), records[0].created)
+	assert.Equal(t, int16(0), records[1].created)
 }
 
 func TestAlreadyExists(t *testing.T) {
@@ -122,7 +135,7 @@ func TestAlreadyExists(t *testing.T) {
 	_, err := s.insert(context.Background(), record{
 		name:      "test",
 		namespace: "default",
-		created:   true,
+		created:   1,
 		value:     "value1",
 	})
 	require.Error(t, err)
@@ -164,7 +177,7 @@ func TestCompactionError(t *testing.T) {
 	assert.Equal(t, int64(3), meta.ListID)
 	assert.Equal(t, int64(1), meta.CompactionID)
 
-	_, err = s.db.Exec("UPDATE compaction SET id = 3 WHERE name = 'recordstest'")
+	_, err = s.sqlDB.Exec("UPDATE compaction SET id = 3 WHERE name = 'recordstest'")
 	require.NoError(t, err)
 
 	meta, records, err = s.list(context.Background(), ptr("default"), nil, 0, false, 0, 0)
@@ -250,36 +263,36 @@ func TestDelete(t *testing.T) {
 	_, err = s.get(context.Background(), "default", "test")
 	assert.True(t, apierrors.IsNotFound(err))
 
-	_, err = s.db.ExecContext(context.Background(), "DELETE FROM compaction WHERE name = 'recordstest'")
+	_, err = s.sqlDB.ExecContext(context.Background(), "DELETE FROM compaction WHERE name = 'recordstest'")
 	require.NoError(t, err)
 
 	_, records, err = s.list(context.Background(), &r.namespace, &r.name, id-1, false, 0, 0)
 	require.NoError(t, err)
 	assert.Len(t, records, 1)
-	assert.False(t, records[0].created)
+	assert.True(t, records[0].created == 0)
 
 	_, records, err = s.list(context.Background(), &r.namespace, &r.name, 1, false, 0, 0)
 	require.NoError(t, err)
 	assert.Len(t, records, 1)
-	assert.True(t, records[0].created)
+	assert.True(t, records[0].created == 1)
 
 	_, records, err = s.list(context.Background(), &r.namespace, &r.name, 1, true, 0, 0)
 	require.NoError(t, err)
 	assert.Len(t, records, 3)
 
 	assert.Equal(t, "value2", records[0].value)
-	assert.False(t, records[0].deleted)
+	assert.False(t, records[0].deleted == 1)
 
 	assert.Equal(t, "value3", records[1].value)
-	assert.False(t, records[1].deleted)
+	assert.False(t, records[1].deleted == 1)
 
 	assert.Equal(t, "value3", records[2].value)
-	assert.True(t, records[2].deleted)
+	assert.True(t, records[2].deleted == 1)
 
 	_, err = s.insert(context.Background(), record{
 		name:      "test",
 		namespace: "default",
-		created:   true,
+		created:   1,
 	})
 	require.NoError(t, err)
 }
@@ -290,14 +303,14 @@ func TestCompaction(t *testing.T) {
 	test2ID, err := s.insert(context.Background(), record{
 		name:    "test2",
 		value:   "value1",
-		created: true,
+		created: 1,
 	})
 	require.NoError(t, err)
 
 	test3ID, err := s.insert(context.Background(), record{
 		name:    "test3",
 		value:   "value1",
-		created: true,
+		created: 1,
 	})
 	require.NoError(t, err)
 
@@ -318,7 +331,7 @@ func TestCompaction(t *testing.T) {
 	_, err = s.insert(context.Background(), record{
 		name:       "test3",
 		value:      "value1",
-		deleted:    true,
+		deleted:    1,
 		previousID: &test3ID,
 	})
 	require.NoError(t, err)
@@ -329,10 +342,14 @@ func TestCompaction(t *testing.T) {
 
 	deleted, err := s.compact(context.Background())
 	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+
+	deleted, err = s.compact(context.Background())
+	require.NoError(t, err)
 	assert.Equal(t, int64(6), deleted)
 
 	var count int64
-	err = s.db.QueryRow("SELECT count(*) FROM recordstest").Scan(&count)
+	err = s.sqlDB.QueryRow("SELECT count(*) FROM recordstest").Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), count)
 
@@ -370,6 +387,7 @@ func TestUIDMatch(t *testing.T) {
 		value:      "value",
 	})
 	require.NotNil(t, err)
-	assert.Equal(t, "Operation cannot be fulfilled on TestKind.testgroup \"test\": UID mismatch existing  != new uid", err.Error())
-	assert.True(t, apierrors.IsConflict(err))
+	assert.Equal(t, `StorageError: invalid object, Code: 4, Key: test, ResourceVersion: 0, AdditionalErrorMsg: Precondition failed: UID in precondition: , UID in object meta: uid`, err.Error())
+	_, ok := err.(*storage.StorageError)
+	assert.True(t, ok)
 }

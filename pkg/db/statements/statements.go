@@ -10,12 +10,14 @@ import (
 type Statements struct {
 	tableName  string
 	statements map[string]string
+	lock       bool
 }
 
-func New(tableName string) *Statements {
+func New(tableName string, lock bool) *Statements {
 	s := &Statements{
 		tableName:  tableName,
 		statements: map[string]string{},
+		lock:       lock,
 	}
 	entries, err := fs.ReadDir(".")
 	if err != nil {

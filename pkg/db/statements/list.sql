@@ -7,7 +7,7 @@ SELECT (SELECT max(id) FROM placeholder) AS max_id,
        namespace,
        previous_id,
        uid,
-       created OR previous_id IS NULL                       AS created,
+       CASE WHEN created = 1 OR previous_id IS NULL THEN 1 ELSE 0 END AS created,
        deleted,
        value
 FROM (SELECT id,
@@ -26,5 +26,5 @@ FROM (SELECT id,
         AND ($3 = 0 OR id <= $3)
         AND ($4 = 0 OR id > $4)) AS r
 WHERE rn = 1
-  AND deleted is false
+  AND deleted = 0
 ORDER BY id
