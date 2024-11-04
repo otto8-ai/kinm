@@ -238,3 +238,66 @@ func TestWatchChanges(t *testing.T) {
 	assert.Equal(t, "5", event.Object.(kclient.Object).GetResourceVersion())
 	assert.Equal(t, "testname2", event.Object.(kclient.Object).GetName())
 }
+
+func TestContinue(t *testing.T) {
+	s := newStrategy(t)
+	_, err := s.Delete(context.Background(), &TestKind{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "testname1",
+			UID:             "testuid1",
+			ResourceVersion: "1",
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = s.Delete(context.Background(), &TestKind{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "testname2",
+			UID:             "testuid2",
+			ResourceVersion: "2",
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = s.Delete(context.Background(), &TestKind{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "testname3",
+			UID:             "testuid3",
+			ResourceVersion: "3",
+		},
+	})
+	require.NoError(t, err)
+
+	res, err := s.List(context.Background(), "", storage.ListOptions{
+		Predicate: storage.SelectionPredicate{
+			Limit: 1,
+		},
+		ResourceVersion: "3",
+	})
+	require.NoError(t, err)
+
+	list := res.(*TestKindList)
+	require.Len(t, list.Items, 1)
+	assert.Equal(t, "1", list.Items[0].ResourceVersion)
+	assert.Equal(t, "testname1", list.Items[0].Name)
+	assert.Equal(t, "3", list.ResourceVersion)
+	assert.Equal(t, "3:1", list.Continue)
+
+	res, err = s.List(context.Background(), "", storage.ListOptions{
+		Predicate: storage.SelectionPredicate{
+			Limit:    2,
+			Continue: list.Continue,
+		},
+	})
+	require.NoError(t, err)
+
+	list = res.(*TestKindList)
+	require.Len(t, list.Items, 2)
+	assert.Equal(t, "2", list.Items[0].ResourceVersion)
+	assert.Equal(t, "testname2", list.Items[0].Name)
+	assert.Equal(t, "3", list.ResourceVersion)
+	assert.Equal(t, "3", list.Items[1].ResourceVersion)
+	assert.Equal(t, "testname3", list.Items[1].Name)
+	assert.Equal(t, "", list.Continue)
+
+}

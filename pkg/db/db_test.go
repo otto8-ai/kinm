@@ -50,15 +50,15 @@ func newSQLDB(t *testing.T) (*sql.DB, bool) {
 		lock bool
 		db   *sql.DB
 	)
-	if os.Getenv("KINM_TEST_DB") == "sqlite" {
-		db, err = sql.Open("sqlite", "otto.db")
-		db.SetMaxOpenConns(1)
-	} else {
+	if os.Getenv("KINM_TEST_DB") == "postgres" {
 		lock = true
 		psqlInfo := fmt.Sprintf("host=%s port=%d user=%s "+
 			"password=%s dbname=%s sslmode=disable",
 			host, port, user, password, dbname)
 		db, err = sql.Open("postgres", psqlInfo)
+	} else {
+		db, err = sql.Open("sqlite", "otto.db")
+		db.SetMaxOpenConns(1)
 	}
 	if err != nil {
 		log.Fatal(err)

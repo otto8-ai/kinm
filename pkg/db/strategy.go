@@ -211,10 +211,6 @@ func (s *Strategy) prepareList(opts storage.ListOptions) (storage.ListOptions, e
 		return opts, fmt.Errorf("resource version match is not supported")
 	}
 
-	if opts.Predicate.Continue != "" && opts.ResourceVersion == "" {
-		return opts, fmt.Errorf("resource version is required with continue")
-	}
-
 	if opts.Predicate.Label == nil {
 		opts.Predicate.Label = labels.Everything()
 	}
@@ -264,7 +260,7 @@ func (s *Strategy) List(ctx context.Context, namespace string, opts storage.List
 		// We check this at the end because the next object could possibly not match the predicate so
 		// we don't want to do continue token to them result in the next call being an empty list.
 		if opts.Predicate.Limit > 0 && len(objs) >= int(opts.Predicate.Limit) {
-			listResult.SetContinue(objs[len(objs)-1].(types.Object).GetResourceVersion())
+			listResult.SetContinue(listResourceVersion + ":" + objs[len(objs)-1].(types.Object).GetResourceVersion())
 			break
 		}
 		objs = append(objs, obj)

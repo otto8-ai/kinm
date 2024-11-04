@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"strconv"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apiserver/pkg/storage"
@@ -24,7 +25,15 @@ func newLister(ctx context.Context, db *db, namespace string, opts storage.ListO
 	}
 
 	if opts.Predicate.Continue != "" {
-		cont, err = strconv.ParseInt(opts.Predicate.Continue, 10, 64)
+		contRev, contAfter, ok := strings.Cut(opts.Predicate.Continue, ":")
+		if !ok || contRev == "" || contAfter == "" {
+			return "", nil, fmt.Errorf("invalid continue token %q", opts.Predicate.Continue)
+		}
+		rev, err = strconv.ParseInt(contRev, 10, 64)
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid continue token %q, failed to parse revision: %w", opts.Predicate.Continue, err)
+		}
+		cont, err = strconv.ParseInt(contAfter, 10, 64)
 		if err != nil {
 			return "", nil, fmt.Errorf("invalid continue token %q, failed to parse: %w", opts.Predicate.Continue, err)
 		}
