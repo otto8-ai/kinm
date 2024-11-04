@@ -323,14 +323,14 @@ func TestCompaction(t *testing.T) {
 
 	test3ID, err = s.insert(context.Background(), record{
 		name:       "test3",
-		value:      "value1",
+		value:      "value2",
 		previousID: &test3ID,
 	})
 	require.NoError(t, err)
 
 	_, err = s.insert(context.Background(), record{
 		name:       "test3",
-		value:      "value1",
+		value:      "value3",
 		deleted:    1,
 		previousID: &test3ID,
 	})

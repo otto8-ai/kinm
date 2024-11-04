@@ -241,6 +241,8 @@ func (d *db) doInsert(ctx context.Context, rec record) (id int64, err error) {
 			return 0, errors.NewResourceVersionMismatch(d.gvk, rec.name)
 		} else if existing.uid != rec.uid {
 			return 0, errors.NewUIDMismatch(rec.name, existing.uid, rec.uid)
+		} else if rec.deleted == 0 && existing.value == rec.value {
+			return existing.id, nil
 		}
 	}
 

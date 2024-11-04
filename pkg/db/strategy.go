@@ -113,6 +113,8 @@ func (s *Strategy) Create(ctx context.Context, object types.Object) (types.Objec
 
 	// On create all objects have a generation of 1
 	object.SetGeneration(1)
+	// All stored objects have a resource version of 0
+	object.SetResourceVersion("0")
 
 	var buf strings.Builder
 	if err := json.NewEncoder(&buf).Encode(object); err != nil {
@@ -158,26 +160,28 @@ func (s *Strategy) Update(ctx context.Context, obj types.Object) (types.Object, 
 }
 
 func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGeneration, deleted bool) (types.Object, error) {
-	var buf strings.Builder
-
-	obj = obj.DeepCopyObject().(types.Object)
-	if updateGeneration {
-		obj.SetGeneration(obj.GetGeneration() + 1)
-	}
-
-	if err := json.NewEncoder(&buf).Encode(obj); err != nil {
-		return nil, err
-	}
-
 	var (
+		buf             strings.Builder
 		resourceVersion int64
 		err             error
 	)
+
 	if obj.GetResourceVersion() != "" {
 		resourceVersion, err = strconv.ParseInt(obj.GetResourceVersion(), 10, 64)
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	obj = obj.DeepCopyObject().(types.Object)
+	if updateGeneration {
+		obj.SetGeneration(obj.GetGeneration() + 1)
+	}
+	// All stored objects have a resource version of 0
+	obj.SetResourceVersion("0")
+
+	if err := json.NewEncoder(&buf).Encode(obj); err != nil {
+		return nil, err
 	}
 
 	rec := record{
