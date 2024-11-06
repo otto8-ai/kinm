@@ -370,7 +370,12 @@ func (s *Strategy) streamWatch(ctx context.Context, namespace string, opts stora
 				ch <- toWatchEventError(err)
 				return
 			}
-			ch <- s.toWatchEvent(rec)
+			event := s.toWatchEvent(rec)
+			if ok, err := opts.Predicate.Matches(event.Object); err != nil {
+				ch <- toWatchEventError(err)
+			} else if ok {
+				ch <- event
+			}
 		}
 
 		var (
