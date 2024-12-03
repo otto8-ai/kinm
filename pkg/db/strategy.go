@@ -193,7 +193,7 @@ func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGenerat
 	}
 
 	var id int64
-	if deleted {
+	if obj.GetDeletionTimestamp() != nil && len(obj.GetFinalizers()) == 0 {
 		id, err = s.db.delete(ctx, rec)
 	} else {
 		id, err = s.db.insert(ctx, rec)
