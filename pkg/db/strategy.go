@@ -156,10 +156,10 @@ func (s *Strategy) Get(ctx context.Context, namespace, name string) (types.Objec
 
 func (s *Strategy) Update(ctx context.Context, obj types.Object) (types.Object, error) {
 	defer s.broadcastChange()
-	return s.doUpdate(ctx, obj, true, false)
+	return s.doUpdate(ctx, obj, true)
 }
 
-func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGeneration, deleted bool) (types.Object, error) {
+func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGeneration bool) (types.Object, error) {
 	var (
 		buf             strings.Builder
 		resourceVersion int64
@@ -207,7 +207,7 @@ func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGenerat
 }
 
 func (s *Strategy) UpdateStatus(ctx context.Context, obj types.Object) (types.Object, error) {
-	return s.doUpdate(ctx, obj, false, false)
+	return s.doUpdate(ctx, obj, false)
 }
 
 func (s *Strategy) prepareList(opts storage.ListOptions) (storage.ListOptions, error) {
@@ -280,7 +280,7 @@ func (s *Strategy) NewList() types.ObjectList {
 
 func (s *Strategy) Delete(ctx context.Context, obj types.Object) (types.Object, error) {
 	defer s.broadcastChange()
-	return s.doUpdate(ctx, obj, false, true)
+	return s.doUpdate(ctx, obj, false)
 }
 
 func (s *Strategy) Watch(ctx context.Context, namespace string, opts storage.ListOptions) (<-chan watch.Event, error) {
