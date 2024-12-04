@@ -17,6 +17,7 @@ import (
 	"github.com/otto8-ai/kinm/pkg/types"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -280,6 +281,11 @@ func (s *Strategy) NewList() types.ObjectList {
 
 func (s *Strategy) Delete(ctx context.Context, obj types.Object) (types.Object, error) {
 	defer s.broadcastChange()
+	if obj.GetDeletionTimestamp() == nil {
+		now := metav1.Now()
+		obj.SetDeletionTimestamp(&now)
+	}
+
 	return s.doUpdate(ctx, obj, false)
 }
 
