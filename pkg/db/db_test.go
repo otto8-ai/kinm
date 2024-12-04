@@ -328,10 +328,9 @@ func TestCompaction(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = s.insert(context.Background(), record{
+	_, err = s.delete(context.Background(), record{
 		name:       "test3",
 		value:      "value3",
-		deleted:    1,
 		previousID: &test3ID,
 	})
 	require.NoError(t, err)
@@ -346,12 +345,12 @@ func TestCompaction(t *testing.T) {
 
 	deleted, err = s.compact(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, int64(6), deleted)
+	assert.Equal(t, int64(4), deleted)
 
 	var count int64
 	err = s.sqlDB.QueryRow("SELECT count(*) FROM recordstest").Scan(&count)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), count)
+	assert.Equal(t, int64(4), count)
 
 	_, records, err = s.list(context.Background(), nil, nil, 8, false, 0, 0)
 	require.NoError(t, err)
@@ -364,6 +363,85 @@ func TestCompaction(t *testing.T) {
 	assert.Equal(t, int64(6), records[1].id)
 	assert.Equal(t, "test2", records[1].name)
 	assert.Equal(t, "value2", records[1].value)
+}
+
+func TestCompactionGreaterThan500Records(t *testing.T) {
+	s := newDatabase(t)
+
+	// Create 550 other records with created = 1 for all of them.
+	for i := range 550 {
+		_, err := s.insert(context.Background(), record{
+			// Use a hyphen to not conflict with other names.
+			name:    fmt.Sprintf("test-%d", i),
+			value:   "value",
+			created: 1,
+		})
+		require.NoError(t, err)
+	}
+
+	test2ID, err := s.insert(context.Background(), record{
+		name:    "test2",
+		value:   "value1",
+		created: 1,
+	})
+	require.NoError(t, err)
+
+	test3ID, err := s.insert(context.Background(), record{
+		name:    "test3",
+		value:   "value1",
+		created: 1,
+	})
+	require.NoError(t, err)
+
+	_, err = s.insert(context.Background(), record{
+		name:       "test2",
+		value:      "value2",
+		previousID: &test2ID,
+	})
+	require.NoError(t, err)
+
+	test3ID, err = s.insert(context.Background(), record{
+		name:       "test3",
+		value:      "value2",
+		previousID: &test3ID,
+	})
+	require.NoError(t, err)
+
+	_, err = s.delete(context.Background(), record{
+		name:       "test3",
+		value:      "value3",
+		previousID: &test3ID,
+	})
+	require.NoError(t, err)
+
+	_, records, err := s.list(context.Background(), nil, nil, 1, true, 0, 0)
+	require.NoError(t, err)
+	assert.Len(t, records, 557)
+
+	deleted, err := s.compact(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+
+	deleted, err = s.compact(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), deleted)
+
+	var count int64
+	err = s.sqlDB.QueryRow("SELECT count(*) FROM recordstest").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, int64(554), count)
+
+	_, records, err = s.list(context.Background(), nil, nil, 558, false, 0, 0)
+	require.NoError(t, err)
+	assert.Len(t, records, 552)
+
+	assert.Equal(t, int64(3), records[0].id)
+	assert.Equal(t, "test", records[0].name)
+	assert.Equal(t, "value3", records[0].value)
+
+	assert.Equal(t, int64(556), records[551].id)
+	assert.Equal(t, "test2", records[551].name)
+	assert.Equal(t, "value2", records[551].value)
 }
 
 func TestConflict(t *testing.T) {
