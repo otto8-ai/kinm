@@ -2,9 +2,12 @@ package strategy
 
 import (
 	"context"
+	"os"
+	"strconv"
 
 	"github.com/otto8-ai/kinm/pkg/types"
 	"github.com/otto8-ai/kinm/pkg/validator"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,21 +53,29 @@ type NamespaceScoper interface {
 var _ rest.Creater = (*CreateAdapter)(nil)
 
 func NewCreate(schema *runtime.Scheme, strategy Creater) *CreateAdapter {
+	generateNameCollisionRetryLimit := 5
+	if newLimit := os.Getenv("KINM_GENERATE_NAME_COLLISION_RETRY_LIMIT"); newLimit != "" {
+		if limit, err := strconv.Atoi(newLimit); err == nil {
+			generateNameCollisionRetryLimit = limit
+		}
+	}
 	return &CreateAdapter{
-		NameGenerator: names.SimpleNameGenerator,
-		Scheme:        schema,
-		strategy:      strategy,
+		NameGenerator:          names.SimpleNameGenerator,
+		Scheme:                 schema,
+		strategy:               strategy,
+		generateNameRetryLimit: generateNameCollisionRetryLimit,
 	}
 }
 
 type CreateAdapter struct {
 	names.NameGenerator
 	*runtime.Scheme
-	strategy          Creater
-	Warner            WarningsOnCreator
-	Validator         Validator
-	NameValidator     NameValidator
-	PrepareForCreater PrepareForCreator
+	strategy               Creater
+	Warner                 WarningsOnCreator
+	Validator              Validator
+	NameValidator          NameValidator
+	PrepareForCreater      PrepareForCreator
+	generateNameRetryLimit int
 }
 
 func (a *CreateAdapter) New() runtime.Object {
@@ -72,39 +83,54 @@ func (a *CreateAdapter) New() runtime.Object {
 }
 
 func (a *CreateAdapter) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
-	if objectMeta, err := meta.Accessor(obj); err == nil {
-		rest.FillObjectMetaSystemFields(objectMeta)
-		if objectMeta.GetName() == "" {
-			requestInfo, ok := request.RequestInfoFrom(ctx)
-			if ok && requestInfo.Name != "" {
-				objectMeta.SetName(requestInfo.Name)
+	retriesRenaming := a.generateNameRetryLimit
+	original := obj.DeepCopyObject()
+
+	for {
+		if objectMeta, err := meta.Accessor(obj); err == nil {
+			rest.FillObjectMetaSystemFields(objectMeta)
+			if objectMeta.GetName() == "" {
+				requestInfo, ok := request.RequestInfoFrom(ctx)
+				if ok && requestInfo.Name != "" {
+					objectMeta.SetName(requestInfo.Name)
+				}
+			}
+
+			if len(objectMeta.GetGenerateName()) > 0 && len(objectMeta.GetName()) == 0 {
+				objectMeta.SetName(a.GenerateName(objectMeta.GetGenerateName()))
+			} else {
+				// Don't retry on already exists errors
+				retriesRenaming = 0
+			}
+		} else {
+			return nil, err
+		}
+
+		if err := rest.BeforeCreate(a, ctx, obj); err != nil {
+			return nil, err
+		}
+
+		// at this point we have a fully formed object.  It is time to call the validators that the apiserver
+		// handling chain wants to enforce.
+		if createValidation != nil {
+			if err := createValidation(ctx, obj.DeepCopyObject()); err != nil {
+				return nil, err
 			}
 		}
 
-		if len(objectMeta.GetGenerateName()) > 0 && len(objectMeta.GetName()) == 0 {
-			objectMeta.SetName(a.GenerateName(objectMeta.GetGenerateName()))
+		if len(options.DryRun) != 0 && options.DryRun[0] == metav1.DryRunAll {
+			return obj, nil
 		}
-	} else {
-		return nil, err
-	}
 
-	if err := rest.BeforeCreate(a, ctx, obj); err != nil {
-		return nil, err
-	}
-
-	// at this point we have a fully formed object.  It is time to call the validators that the apiserver
-	// handling chain wants to enforce.
-	if createValidation != nil {
-		if err := createValidation(ctx, obj.DeepCopyObject()); err != nil {
-			return nil, err
+		newObj, err := a.strategy.Create(ctx, obj.(types.Object))
+		if retriesRenaming <= 1 || !errors.IsAlreadyExists(err) {
+			// Retry at most 5 times.
+			return newObj, err
 		}
-	}
 
-	if len(options.DryRun) != 0 && options.DryRun[0] == metav1.DryRunAll {
-		return obj, nil
+		retriesRenaming--
+		obj = original.DeepCopyObject()
 	}
-
-	return a.strategy.Create(ctx, obj.(types.Object))
 }
 
 func (a *CreateAdapter) PrepareForCreate(ctx context.Context, obj runtime.Object) {
