@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/otto8-ai/kinm/pkg/db/statements"
-	"github.com/otto8-ai/kinm/pkg/strategy"
-	"github.com/otto8-ai/kinm/pkg/types"
+	"github.com/acorn-io/kinm/pkg/db/statements"
+	"github.com/acorn-io/kinm/pkg/strategy"
+	"github.com/acorn-io/kinm/pkg/types"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

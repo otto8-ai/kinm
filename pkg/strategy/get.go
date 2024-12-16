@@ -3,7 +3,7 @@ package strategy
 import (
 	"context"
 
-	"github.com/otto8-ai/kinm/pkg/types"
+	"github.com/acorn-io/kinm/pkg/types"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/endpoints/request"

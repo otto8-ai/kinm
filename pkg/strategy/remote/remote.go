@@ -3,8 +3,8 @@ package remote
 import (
 	"context"
 
-	"github.com/otto8-ai/kinm/pkg/strategy"
-	"github.com/otto8-ai/kinm/pkg/types"
+	"github.com/acorn-io/kinm/pkg/strategy"
+	"github.com/acorn-io/kinm/pkg/types"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"

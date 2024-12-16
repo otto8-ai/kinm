@@ -1,7 +1,7 @@
 package strategy
 
 import (
-	"github.com/otto8-ai/kinm/pkg/types"
+	"github.com/acorn-io/kinm/pkg/types"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"

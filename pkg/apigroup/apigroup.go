@@ -1,7 +1,7 @@
 package apigroup
 
 import (
-	"github.com/otto8-ai/kinm/pkg/serializer"
+	"github.com/acorn-io/kinm/pkg/serializer"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"

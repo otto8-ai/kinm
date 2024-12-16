@@ -1,4 +1,4 @@
-module github.com/otto8-ai/kinm
+module github.com/acorn-io/kinm
 
 go 1.23
 

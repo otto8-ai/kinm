@@ -5,8 +5,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/otto8-ai/kinm/pkg/types"
-	"github.com/otto8-ai/kinm/pkg/validator"
+	"github.com/acorn-io/kinm/pkg/types"
+	"github.com/acorn-io/kinm/pkg/validator"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

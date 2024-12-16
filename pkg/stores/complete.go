@@ -1,7 +1,7 @@
 package stores
 
 import (
-	"github.com/otto8-ai/kinm/pkg/strategy"
+	"github.com/acorn-io/kinm/pkg/strategy"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/rest"
 )

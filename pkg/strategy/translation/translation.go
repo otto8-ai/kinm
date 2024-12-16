@@ -4,8 +4,8 @@ import (
 	"context"
 	"strings"
 
-	"github.com/otto8-ai/kinm/pkg/strategy"
-	"github.com/otto8-ai/kinm/pkg/types"
+	"github.com/acorn-io/kinm/pkg/strategy"
+	"github.com/acorn-io/kinm/pkg/types"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"

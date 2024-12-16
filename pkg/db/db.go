@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	_ "embed"
 
-	"github.com/otto8-ai/kinm/pkg/db/errors"
-	"github.com/otto8-ai/kinm/pkg/db/statements"
+	"github.com/acorn-io/kinm/pkg/db/errors"
+	"github.com/acorn-io/kinm/pkg/db/statements"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
