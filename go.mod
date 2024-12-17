@@ -1,4 +1,4 @@
-module github.com/acorn-io/kinm
+module github.com/obot-platform/kinm
 
 go 1.23
 

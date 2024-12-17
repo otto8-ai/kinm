@@ -1,7 +1,7 @@
 package stores
 
 import (
-	"github.com/acorn-io/kinm/pkg/strategy"
+	"github.com/obot-platform/kinm/pkg/strategy"
 	"k8s.io/apiserver/pkg/registry/rest"
 )
 

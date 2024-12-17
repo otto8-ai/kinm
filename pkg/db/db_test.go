@@ -8,9 +8,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/acorn-io/kinm/pkg/db/statements"
 	_ "github.com/glebarez/go-sqlite"
 	_ "github.com/lib/pq"
+	"github.com/obot-platform/kinm/pkg/db/statements"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"

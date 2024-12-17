@@ -3,7 +3,7 @@ package strategy
 import (
 	"context"
 
-	"github.com/acorn-io/kinm/pkg/types"
+	"github.com/obot-platform/kinm/pkg/types"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"

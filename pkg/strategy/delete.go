@@ -3,7 +3,7 @@ package strategy
 import (
 	"context"
 
-	"github.com/acorn-io/kinm/pkg/types"
+	"github.com/obot-platform/kinm/pkg/types"
 	apierror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"

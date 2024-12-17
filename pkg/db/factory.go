@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/acorn-io/kinm/pkg/db/glogrus"
-	"github.com/acorn-io/kinm/pkg/strategy"
-	"github.com/acorn-io/kinm/pkg/types"
 	"github.com/glebarez/sqlite"
+	"github.com/obot-platform/kinm/pkg/db/glogrus"
+	"github.com/obot-platform/kinm/pkg/strategy"
+	"github.com/obot-platform/kinm/pkg/types"
 	"github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

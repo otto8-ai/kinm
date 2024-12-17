@@ -3,8 +3,8 @@ package translation
 import (
 	"context"
 
-	"github.com/acorn-io/kinm/pkg/strategy"
-	mtypes "github.com/acorn-io/kinm/pkg/types"
+	"github.com/obot-platform/kinm/pkg/strategy"
+	mtypes "github.com/obot-platform/kinm/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/storage"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
