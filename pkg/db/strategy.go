@@ -208,6 +208,7 @@ func (s *Strategy) doUpdate(ctx context.Context, obj types.Object, updateGenerat
 }
 
 func (s *Strategy) UpdateStatus(ctx context.Context, obj types.Object) (types.Object, error) {
+	defer s.broadcastChange()
 	return s.doUpdate(ctx, obj, false)
 }
 
